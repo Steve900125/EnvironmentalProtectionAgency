@@ -1,54 +1,63 @@
+from flask import Flask, request, abort
+from agent import run_agent
+
+from linebot.v3 import (
+    WebhookHandler
+)
+from linebot.v3.exceptions import (
+    InvalidSignatureError
+)
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage
+)
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent
+)
+
 from dotenv import dotenv_values
-from langchain_openai import ChatOpenAI # type: ignore
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage # type: ignore
-from langgraph.checkpoint.memory import MemorySaver # type: ignore
-from langgraph.prebuilt import create_react_agent # type: ignore
-from typing import Optional, List
-from tools.AirQuality import get_air_quality
-from tools.RagFAQ import get_rag_faq
 
 # Load api key
 config = dotenv_values(".env") 
-OPENAI_API_KEY = config['OPENAI_API_KEY']
 
+app = Flask(__name__)
 
-def create_agent():
-    
-    # Memory with session ID
-    memory = MemorySaver()
-    # Load model (gpt-4o)
-    model = ChatOpenAI(model="gpt-4o",verbose = True)
-    # Load tools
-    tools = [get_air_quality, get_rag_faq]
-    agent_executor = create_react_agent(model, tools, checkpointer=memory)
-    
-    return agent_executor
+configuration = Configuration(access_token=config['CHANNEL_ACCESS_TOKEN'])
+handler = WebhookHandler(config['CHANNEL_SECRET'])
 
-def run_agent(history: Optional[List[BaseMessage]] = None):
-    agent = create_agent()
-    print('Agent is now running')
+@app.route("/callback", methods=['POST'])
+def callback():
+    # get X-Line-Signature header value
+    signature = request.headers['X-Line-Signature']
 
-    # Configuration for session ID
-    config = {"configurable": {"thread_id": 'tester'}}
+    # get request body as text
+    body = request.get_data(as_text=True)
+    app.logger.info("Request body: " + body)
 
-    # 如果有提供歷史消息，將它們更新到代理的內存中
-    if history:
-        agent.update_state(config, {"messages": history})
-    
-    sys_prompt = '你是環保局QA小幫手負責協助民眾問題，回答皆使用繁體中文'
-    SystemMessage(content=sys_prompt)
-    agent.update_state(config, {"messages": sys_prompt})
+    # handle webhook body
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        app.logger.info("Invalid signature. Please check your channel access token/channel secret.")
+        abort(400)
 
-    while True:
-        question = input("Please enter your question (or 'Q' to quit): ")
-        if question.upper() == "Q":
-            break
+    return 'OK'
 
-        # Invoke the agent with the provided session ID
-        response = agent.invoke({"messages": [HumanMessage(content=question)]}, config)
-        if response["messages"][-1].tool_calls:
-            print(response["messages"][-1].tool_calls)
-        print(response["messages"][-1].content)  # Print the agent's response
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        response = run_agent(question=event.message.text)
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=response)]
+            )
+        )
         
-if __name__=="__main__":
-    run_agent()
+if __name__ == "__main__":
+    app.run()
